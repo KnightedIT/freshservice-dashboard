@@ -1,0 +1,193 @@
+const { SecretManagerServiceClient } = require('@google-cloud/secret-manager');
+const axios = require('axios');
+const { BigQuery } = require('@google-cloud/bigquery');
+
+const project_id = 'freshservice-data-handler';
+const secret_id = 'freshServiceAdminAPIKey';
+const version_id = 'latest';
+const datasetId = 'it_fs_tickets';
+const tableId = 'time_entries_raw';
+
+// Function to fetch the API key from Secret Manager
+const fetchSecret = async () => {
+  const client = new SecretManagerServiceClient();
+  const name = `projects/${project_id}/secrets/${secret_id}/versions/${version_id}`;
+  const [version] = await client.accessSecretVersion({ name });
+  return version.payload.data.toString('utf8');
+};
+
+// Function to fetch all filtered tickets using the API key
+const fetchAllFilteredTickets = async (apiKey) => {
+  const allTicketIds = [];
+  let page = 1;
+  let hasNextPage = true;
+
+  while (hasNextPage) {
+    try {
+      const response = await axios.get('https://knighted.freshservice.com/api/v2/tickets/filter?query="tag:TimeEntry"', {
+        headers: {
+          'Authorization': `Basic ${Buffer.from(apiKey).toString('base64')}`,
+          'Cookie': 'current_workspace_id=1'
+        },
+        params: {
+          page: page,
+          per_page: 100
+        }
+      });
+
+      const tickets = response.data.tickets;
+      const ticketIds = tickets
+        .filter(ticket => ticket.workspace_id === 2) // Filter tickets with workspace_id = 2
+        .map(ticket => ticket.id);
+      allTicketIds.push(...ticketIds);
+
+      console.log(`Page ${page}: Fetched ${tickets.length} tickets, ${ticketIds.length} with workspace_id = 2`);
+      console.log(`Total ticket IDs so far: ${allTicketIds.length}`);
+
+      hasNextPage = tickets.length === 100;
+      page += 1;
+    } catch (error) {
+      console.error('Error fetching tickets:', error.response ? error.response.data : error.message);
+      hasNextPage = false;
+    }
+  }
+
+  console.log(`Total number of ticket IDs fetched: ${allTicketIds.length}`);
+  return allTicketIds;
+};
+
+// Function to fetch time entries for ticket IDs in batches of 70
+const fetchTimeEntriesInBatches = async (apiKey, ticketIds) => {
+  const timeEntriesMap = new Map();
+  let apiCalls = 0;
+
+  const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  for (let i = 0; i < ticketIds.length; i += 70) {
+    const batch = ticketIds.slice(i, i + 70);
+
+    const batchPromises = batch.map(async (ticketId) => {
+      try {
+        const response = await axios.get(`https://knighted.freshservice.com/api/v2/tickets/${ticketId}/time_entries`, {
+          headers: {
+            'Authorization': `Basic ${Buffer.from(apiKey).toString('base64')}`,
+            'Cookie': 'current_workspace_id=1'
+          }
+        });
+
+        response.data.time_entries.forEach(entry => {
+          if (!timeEntriesMap.has(ticketId)) {
+            timeEntriesMap.set(ticketId, []);
+          }
+          timeEntriesMap.get(ticketId).push({
+            ticket_id: ticketId,
+            id: entry.id,
+            created_at: entry.created_at,
+            updated_at: entry.updated_at,
+            start_time: entry.start_time,
+            timer_running: entry.timer_running,
+            billable: entry.billable,
+            time_spent: entry.time_spent.toString(),
+            executed_at: entry.executed_at,
+            task_id: entry.task_id,
+            workspace_id: entry.workspace_id,
+            note: entry.note,
+            agent_id: entry.agent_id,
+            custom_fields: JSON.stringify(entry.custom_fields)
+          });
+        });
+
+        apiCalls += 1;
+        console.log(`API call ${apiCalls}: Ticket ID ${ticketId}, Data:`, response.data.time_entries);
+      } catch (error) {
+        console.error(`Error fetching time entries for ticket ID ${ticketId}:`, error.response ? error.response.data : error.message);
+      }
+    });
+
+    await Promise.all(batchPromises);
+    console.log(`Batch ${Math.floor(i / 70) + 1} completed. Waiting for rate limit...`);
+    await delay(60000); // Wait for 1 minute to respect the rate limit
+  }
+
+  console.log(`Total number of ticket IDs in the array: ${ticketIds.length}`);
+  console.log(`Total number of API calls made: ${apiCalls}`);
+
+  // Flatten the grouped data for BigQuery insertion
+  const dataForBigQuery = Array.from(timeEntriesMap.values()).flat();
+  return dataForBigQuery;
+};
+
+// Function to create or replace the table in BigQuery
+const createOrReplaceTable = async (bigquery, datasetId, tableId) => {
+  const schema = [
+    { name: 'ticket_id', type: 'INTEGER' },
+    { name: 'id', type: 'INTEGER' },
+    { name: 'created_at', type: 'TIMESTAMP' },
+    { name: 'updated_at', type: 'TIMESTAMP' },
+    { name: 'start_time', type: 'TIMESTAMP' },
+    { name: 'timer_running', type: 'BOOLEAN' },
+    { name: 'billable', type: 'BOOLEAN' },
+    { name: 'time_spent', type: 'STRING' },
+    { name: 'executed_at', type: 'TIMESTAMP' },
+    { name: 'task_id', type: 'INTEGER' },
+    { name: 'workspace_id', type: 'INTEGER' },
+    { name: 'note', type: 'STRING' },
+    { name: 'agent_id', type: 'INTEGER' },
+    { name: 'custom_fields', type: 'STRING' }
+  ];
+
+  const table = bigquery.dataset(datasetId).table(tableId);
+
+  try {
+    await table.delete();
+    console.log(`Table ${tableId} deleted.`);
+  } catch (error) {
+    if (error.code === 404) {
+      console.log(`Table ${tableId} does not exist.`);
+    } else {
+      throw error;
+    }
+  }
+
+  await table.create({ schema, location: 'US' });
+  console.log(`Table ${tableId} created.`);
+};
+
+// Function to insert data into BigQuery
+const insertDataIntoBigQuery = async (data) => {
+  const bigquery = new BigQuery();
+  await createOrReplaceTable(bigquery, datasetId, tableId);
+
+  try {
+    await bigquery
+      .dataset(datasetId)
+      .table(tableId)
+      .insert(data);
+    console.log(`Inserted ${data.length} rows into BigQuery`);
+  } catch (error) {
+    console.error('Error inserting data into BigQuery:', error);
+    if (error.name === 'PartialFailureError') {
+      error.errors.forEach(err => {
+        console.error('Row error:', err.row);
+        err.errors.forEach(e => {
+          console.error('Error details:', e.message, e.reason);
+        });
+      });
+    }
+  }
+};
+
+// Main function to run the script
+const main = async () => {
+  try {
+    const apiKey = await fetchSecret();
+    const ticketIds = await fetchAllFilteredTickets(apiKey);
+    const dataForBigQuery = await fetchTimeEntriesInBatches(apiKey, ticketIds);
+    await insertDataIntoBigQuery(dataForBigQuery);
+  } catch (err) {
+    console.error('Error:', err.message);
+  }
+};
+
+// Run the main function
+main();
